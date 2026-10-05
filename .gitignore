@@ -1,0 +1,8 @@
+# Built add-on (published as a release asset)
+*.xpi
+node_modules/
+# Internal project records, kept local
+BRIEF.md
+STATUS.md
+KNOWLEDGE.md
+DECISIONS.md
