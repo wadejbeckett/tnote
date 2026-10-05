@@ -8,9 +8,12 @@
   .row { display: flex; gap: 8px; justify-content: flex-end; }
   #del { margin-right: auto; }
   #status:empty { display: none; }
+  #back { color: #2E8B57; text-decoration: none; }
+  #back:hover { text-decoration: underline; }
   body.empty #subject, body.empty textarea, body.empty .row { display: none; }
 </style></head>
 <body>
+  <a id="back" href="list.html" hidden>← All notes</a>
   <div id="subject"></div>
   <textarea id="text" disabled aria-label="Note" placeholder="Why is this message the way it is?"></textarea>
   <div id="status" role="status"></div>

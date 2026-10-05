@@ -219,8 +219,11 @@ class ApiBuilder {
         return (hold ? hold.promise : Promise.resolve())
           .then(() => {
             // Test hook: world.faults["ns.fn"] makes the implementation reject.
+            // A function fault is asked per call, (ctx) => Error or nothing, so
+            // a test can fail one page's calls and leave another's alone.
             const fault = self.world.faults?.[path];
-            if (fault) throw fault;
+            const error = typeof fault === "function" ? fault(ctx) : fault;
+            if (error) throw error;
             return implFn(actuals, ctx);
           })
           .then((result) => {

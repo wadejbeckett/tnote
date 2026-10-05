@@ -1,7 +1,7 @@
 // Shows the note as a slim bar at the top of the open message. The shadow root
 // keeps the email's CSS off the bar's contents (not off the host element itself).
 (async () => {
-  const note = await browser.runtime.sendMessage({ type: "forDisplay" });
+  const note = await browser.runtime.sendMessage({ type: "forDisplay" }).catch(() => null);
   if (!note) return;
   const host = document.createElement("div");
   const root = host.attachShadow({ mode: "closed" });

@@ -142,11 +142,14 @@ describe("manifest.json", { skip }, () => {
     assert.match(warnings[0], /accountRead/);
   });
 
-  it("negative control: without accountsRead the static scan still passes, but mailTabs.setSelectedMessages rejects at run time", async (t) => {
+  it("negative control: without accountsRead the static scan still passes, but selecting and folder searches reject at run time", async (t) => {
     // The schema lists ["messagesRead", "accountsRead"] for setSelectedMessages,
     // and an entry is injected when any one of its permissions is granted, so
     // the scan cannot catch this; the implementation checks both
-    // (ext-mailTabs.js:641-648). The list then falls back to opening a tab.
+    // (ext-mailTabs.js:641-648). Likewise messages.query with folderId needs
+    // accountsRead (ExtensionMessages.sys.mjs:2351-2357), which only the
+    // implementation checks. v0.6.0 would then only log a failed selection
+    // and search every folder each time.
     const m = readManifest();
     m.permissions = m.permissions.filter((p) => p !== "accountsRead");
     assert.deepEqual(scan(m).problems, []);
@@ -156,10 +159,18 @@ describe("manifest.json", { skip }, () => {
     await assert.rejects(api.mailTabs.setSelectedMessages(tb.mailTab.id, []), {
       message: 'Using mailTabs.setSelectedMessages() requires the "accountsRead" and the "messagesRead" permission',
     });
+    await assert.rejects(api.messages.query({ folderId: "account1://INBOX", headerMessageId: "x@example.com", messagesPerPage: 1 }), {
+      message: 'Querying by folder requires the "accountsRead" permission',
+    });
     const full = new FakeThunderbird();
     t.after(() => full.dispose());
     const ok = full.createContext("with accountsRead", "addon_child", BASE_URL + "list.html").api;
     assert.equal(await ok.mailTabs.setSelectedMessages(full.mailTab.id, []), undefined);
+    assert.deepEqual((await ok.messages.query({ folderId: "account1://INBOX", headerMessageId: "x@example.com", messagesPerPage: 1 })).messages, []);
+  });
+
+  it("is version 0.6.1", () => {
+    assert.equal(readManifest().version, "0.6.1");
   });
 
   it("tnote.xpi contains exactly the current src/ files plus LICENSE", (t) => {

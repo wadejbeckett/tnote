@@ -11,7 +11,13 @@
   .subject { flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .date, .from { opacity: .7; white-space: nowrap; }
   .from { overflow: hidden; text-overflow: ellipsis; font-size: 92%; }
+  /* Keep every row the same height while details fill in, so rows don't move
+     under the pointer. */
+  .from:empty::before, .date:empty::before { content: "\00a0"; }
   .note { margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .del { border: 0; background: none; color: inherit; opacity: .45; cursor: pointer; font: inherit; padding: 0 2px; }
+  .del:hover, .del:focus { opacity: 1; }
+  .del.armed { opacity: 1; color: #fff; background: #c0392b; border-radius: 3px; padding: 0 6px; }
   #status { padding: 4px 12px 12px; opacity: .7; }
   #status:empty { display: none; }
 </style></head>

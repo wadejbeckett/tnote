@@ -59,10 +59,10 @@ async function openPanel(action, url, opts, reset) {
 
 // getDisplayedMessage waits for the reading pane to finish loading; don't let a
 // slow or failed load hold up the editor.
-const displayedMessage = (tabId) =>
+const displayedMessage = (tabId, ms = 1000) =>
   Promise.race([
     messenger.messageDisplay.getDisplayedMessage(tabId).catch(() => null),
-    new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
+    new Promise((resolve) => setTimeout(() => resolve(null), ms)),
   ]);
 
 messenger.menus.onClicked.addListener(async (info, tab) => {
@@ -71,9 +71,15 @@ messenger.menus.onClicked.addListener(async (info, tab) => {
   const msg = msgs[0];
   const url = POPUP + "?id=" + msg.id;
   const opts = { windowId: tab?.windowId };
-  // The header panel hangs off the displayed message, so use it only when that is
-  // the message that was right-clicked; otherwise use the main toolbar button.
-  const shown = tab ? await displayedMessage(tab.id) : null;
+  // The header panel hangs off the displayed message. If another message is on
+  // display, select the right-clicked one first, as clicking it would, so the note
+  // opens under it. The toolbar panel is only for when nothing can be displayed
+  // (reading pane hidden).
+  let shown = tab ? await displayedMessage(tab.id) : null;
+  if (tab?.mailTab && shown?.id !== msg.id) {
+    await messenger.mailTabs.setSelectedMessages(tab.id, [msg.id]).catch(warn);
+    shown = await displayedMessage(tab.id, 2000);
+  }
   const opened =
     (shown?.id === msg.id && (await openPanel(messenger.messageDisplayAction, url, opts, POPUP))) ||
     (await openPanel(messenger.browserAction, url, opts, LIST));
@@ -92,13 +98,85 @@ async function currentMessageId() {
 
 let saving = Promise.resolve();
 
+// What the All notes list shows, plus the folder, so finding the message later
+// searches one folder. Searching every folder (no folderId) reads every message
+// header in every account, which takes far too long on large mailboxes.
+const infoFor = (m) => ({
+  subject: m.subject,
+  author: m.author,
+  date: m.date?.getTime?.() ?? m.date,
+  mid: m.headerMessageId,
+  folderId: m.folder?.id,
+});
+
+async function query(q) {
+  const page = await messenger.messages.query({ ...q, messagesPerPage: 1 }).catch(() => null);
+  return page?.messages?.[0] || null;
+}
+
+// Finds a noted message by Message-ID: in its last known folder first, then
+// everywhere (slow). Remembers where it was found.
+async function findMessage(mid, { remember = true, info } = {}) {
+  if (!mid) return null;
+  const infoKey = "info:" + mid;
+  info ??= (await messenger.storage.local.get(infoKey))[infoKey];
+  let m = info?.folderId ? await query({ folderId: info.folderId, headerMessageId: mid }) : null;
+  m ||= await query({ headerMessageId: mid });
+  if (m && remember && (!info || info.missing || info.folderId !== m.folder?.id)) {
+    await messenger.storage.local.set({ [infoKey]: infoFor(m) });
+  }
+  return m;
+}
+
+async function untag(m) {
+  if (m.external || !m.tags.includes(TAG)) return;
+  await messenger.messages.update(m.id, { tags: m.tags.filter((t) => t !== TAG) });
+}
+
 messenger.runtime.onMessage.addListener(async (req, sender) => {
   if (req.type === "forDisplay") {
     if (!sender.tab) return null;
     const m = await messenger.messageDisplay.getDisplayedMessage(sender.tab.id);
     if (!m) return null;
     const key = keyFor(m);
-    return { key, text: (await messenger.storage.local.get(key))[key] || "" };
+    const text = (await messenger.storage.local.get(key))[key] || "";
+    // Keep the list's record current (folder moves, notes saved before 0.6).
+    if (text && m.headerMessageId && !m.external) {
+      const infoKey = "info:" + m.headerMessageId;
+      const info = (await messenger.storage.local.get(infoKey))[infoKey];
+      if (info?.folderId !== m.folder?.id) messenger.storage.local.set({ [infoKey]: infoFor(m) }).catch(warn);
+    }
+    return { key, text };
+  }
+  if (req.type === "describe") {
+    // A list row without details: look the message up once. If it can't be found,
+    // say so on record, so the list doesn't search every folder on every opening.
+    if (!req.mid) return null;
+    const m = await findMessage(req.mid, { remember: false });
+    const info = m ? infoFor(m) : { mid: req.mid, missing: true };
+    // Only keep the record while the note exists; it may have been deleted
+    // during a slow search.
+    const noteKey = "note:" + req.mid;
+    const infoKey = "info:" + req.mid;
+    const stored = await messenger.storage.local.get([noteKey, infoKey]);
+    const old = stored[infoKey];
+    const changed = !old || !!old.missing !== !!info.missing || old.folderId !== info.folderId;
+    if (stored[noteKey] && changed) await messenger.storage.local.set({ [infoKey]: info });
+    return info;
+  }
+  if (req.type === "reveal") {
+    // Select the note's message in the window's mail tab, switching folder.
+    const m = await findMessage(req.mid);
+    if (!m) return null;
+    const [tab] = await messenger.tabs.query({ active: true, windowId: req.windowId, mailTab: true });
+    if (tab) await messenger.mailTabs.setSelectedMessages(tab.id, [m.id]).catch(warn);
+    return { id: m.id };
+  }
+  if (req.type === "remove") {
+    // Queued with saves, so a save still finishing can't bring the note back.
+    const result = saving.then(() => remove(req.key));
+    saving = result.catch(() => {});
+    return result;
   }
   if (req.type === "load") {
     const id = req.id || (await currentMessageId());
@@ -124,10 +202,7 @@ async function save(req) {
   // "info:" keeps what the All notes list shows, so it needn't search for messages.
   const info = "info:" + key.slice(5);
   if (text) {
-    await messenger.storage.local.set({
-      [key]: text,
-      [info]: { subject: m.subject, author: m.author, date: m.date?.getTime?.() ?? m.date, mid: m.headerMessageId },
-    });
+    await messenger.storage.local.set({ [key]: text, [info]: infoFor(m) });
   } else {
     await messenger.storage.local.remove([key, info]);
   }
@@ -147,6 +222,19 @@ async function save(req) {
       console.warn("tNOTE: note saved but the message could not be tagged", e);
     }
   }
+  return true;
+}
+
+// Delete from the list, by storage key suffix (a Message-ID, or "id:N" for a
+// message without one): note and record first, then the tag once the message is
+// found via the folder on record.
+async function remove(key) {
+  const infoKey = "info:" + key;
+  const info = (await messenger.storage.local.get(infoKey))[infoKey] || {};
+  await messenger.storage.local.remove(["note:" + key, infoKey]);
+  if (key.startsWith("id:")) return true;
+  const m = await findMessage(key, { remember: false, info }).catch(() => null);
+  if (m) await untag(m).catch(warn);
   return true;
 }
 

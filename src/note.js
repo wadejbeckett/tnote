@@ -1,6 +1,9 @@
 // The note saves itself as you type, so closing the panel by clicking elsewhere
 // never loses it.
-let id = Number(new URLSearchParams(location.search).get("id")) || null;
+const params = new URLSearchParams(location.search);
+let id = Number(params.get("id")) || null;
+// Opened from the All notes list: offer the way back.
+document.getElementById("back").hidden = params.get("from") !== "list";
 const text = document.getElementById("text");
 const status = document.getElementById("status");
 const del = document.getElementById("del");

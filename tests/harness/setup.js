@@ -15,7 +15,7 @@ const skip = schemas.ok ? false : `${schemas.reason} - schema-checked tests skip
  * @param {Array}  [o.messages]  addMessage() options, in id order (ids start at 1)
  * @param {Array}  [o.tags]      initial tag list (default: Thunderbird's five)
  * @param {object} [o.storage]   initial storage.local content
- * @param {object} [o.faults]    "ns.fn" -> Error, in force from startup (see tb.faults)
+ * @param {object} [o.faults]    "ns.fn" -> Error (or (ctx) => Error|undefined), in force from startup (see tb.faults)
  */
 async function boot(t, { config, manifest, src, messages = [{ subject: "Invoice 42" }], tags, storage = {}, faults = {} } = {}) {
   const tb = new FakeThunderbird({ config, manifest, src });

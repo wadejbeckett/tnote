@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "tNOTE",
   "description": "Right-click a message to add a private note; read it at the top of the message.",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "author": "Noiz",
   "browser_specific_settings": {
     "gecko": {

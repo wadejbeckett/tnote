@@ -4,6 +4,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { boot, assertClean, tagsOf, advance, flush, skip } = require("./harness/setup.js");
+const { readSource } = require("./harness/thunderbird.js");
 
 const THREE = [{ subject: "Invoice 42" }, { subject: "Quote for racks" }, { subject: "Lunch?" }];
 const SELECT_ONE = "Select one message to add a note.";
@@ -675,6 +676,52 @@ describe("saves are sent once and retried after a failure; Delete only for a loa
     const { $ } = await editor(tb, "note.html");
     assert.equal($("status").textContent, SELECT_ONE);
     assert.equal($("del").hidden, true);
+    assertClean(tb);
+  });
+});
+
+describe("\"← All notes\" link (v0.6.0)", { skip }, () => {
+  it("is shown only when the note was opened from the list (from=list)", async (t) => {
+    const { tb } = await boot(t, { messages: THREE });
+    tb.selectMessages([2]);
+    for (const [url, hidden] of [
+      ["note.html?id=2&from=list", false],
+      ["note.html?from=list&id=2", false],
+      ["note.html?id=2", true], // a right-click's panel
+      ["note.html", true], // the header button's own page
+      ["note.html?id=2&from=menu", true],
+      ["note.html?id=2&from=LIST", true],
+    ]) {
+      const { $ } = await editor(tb, url);
+      assert.equal($("back").hidden, hidden, url);
+      assert.equal($("subject").textContent, "Quote for racks", `${url} still edits its message`);
+    }
+    assertClean(tb);
+  });
+
+  it("is hidden in note.html itself, and links to list.html", async (t) => {
+    const { tb } = await boot(t, { messages: THREE });
+    const page = tb.loadExtensionPage("note.html?id=1&from=list", { name: "editor" });
+    const back = page.document.getElementById("back");
+    assert.equal(back.localName, "a");
+    assert.equal(back.getAttribute("href"), "list.html");
+    assert.equal(back.textContent, "← All notes");
+    assert.equal(back.hidden, false, "shown by note.js straight away, before the note loads");
+    const plain = tb.loadExtensionPage("note.html", { name: "editor" });
+    assert.equal(plain.document.getElementById("back").hidden, true);
+    // note.html itself, before any script runs (no flash of the link).
+    const { JSDOM } = require("jsdom");
+    const raw = new JSDOM(readSource("note.html")).window.document.getElementById("back");
+    assert.equal(raw.hasAttribute("hidden"), true);
+    await flush();
+    assertClean(tb);
+  });
+
+  it("stays available when the note cannot be loaded, so there is a way back", async (t) => {
+    const { tb } = await boot(t);
+    const { $ } = await editor(tb, "note.html?id=99&from=list");
+    assert.equal($("status").textContent, "Couldn't open the note: Message not found: 99.");
+    assert.equal($("back").hidden, false);
     assertClean(tb);
   });
 });

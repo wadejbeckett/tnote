@@ -137,6 +137,22 @@ describe("note bar (display.js)", { skip }, () => {
     assertClean(tb);
   });
 
+  it("a forDisplay request that fails leaves the message without a bar, and nothing unhandled (v0.6.1)", async (t) => {
+    // For example the background failing to ask Thunderbird for the displayed
+    // message. v0.6.0 did not catch it: an unhandled rejection in the message's
+    // content script.
+    const { tb } = await boot(t, { messages: TWO, storage: { "note:msg1@example.com": "Waiting for PO" } });
+    tb.faults["messageDisplay.getDisplayedMessage"] = new Error("not ready");
+    const page = await show(tb, 1);
+    const asked = tb.calls.filter((c) => c.api === "runtime.sendMessage" && c.context === page.ctx.name);
+    assert.deepEqual(asked.map((c) => [c.args[0], c.rejected]), [[{ type: "forDisplay" }, "not ready"]]);
+    assert.equal(page.shadowRoots.length, 0, "no bar");
+    assert.equal(page.document.body.firstElementChild.id, "email");
+    assert.equal(tb.listeners.filter((l) => l.ctx === page.ctx).length, 0, "and no listener left behind");
+    assert.deepEqual(tb.unhandled.map(String), []);
+    assertClean(tb);
+  });
+
   it("works in a separate message window", async (t) => {
     const { tb } = await boot(t, { messages: TWO, storage: { "note:msg2@example.com": "In a window" } });
     const { page } = tb.openMessageWindow(2);

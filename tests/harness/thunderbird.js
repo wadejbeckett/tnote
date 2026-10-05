@@ -23,6 +23,45 @@ const { loadThunderbirdSchemas } = require("./omni.js");
 const { SchemaRoot } = require("./schemas.js");
 const { ApiBuilder, FakeError } = require("./api.js");
 
+/**
+ * MODEL: an extension page that navigates to another extension page (list.js
+ * setting location.href, note.html's "← All notes" link) gets the new document
+ * in the same <browser>. For an action popup that means the panel stays open
+ * and shows the new page: nothing in ExtensionPopups.sys.mjs reacts to the
+ * browser navigating (its handlers are the chrome window's unload, popuphiding,
+ * popuppositioned, pagetitlechanged and DOMWindowClose, :173-216). The old
+ * document unloads ("pagehide") and its extension context goes away
+ * (ExtensionCommon.sys.mjs:595-612). jsdom does not implement navigation
+ * between documents (it reports "Not implemented: navigation"), so the fake
+ * wraps jsdom's navigate() for the windows it marks with _fakeNavigate. The
+ * wrapper must be in place before jsdom's Location and hyperlink code bind to
+ * navigate() (they destructure it when first loaded), hence at module load.
+ */
+const jsdomNavigation = (() => {
+  let api;
+  try {
+    api = require.resolve("jsdom");
+  } catch {
+    return { ok: false, reason: "jsdom is missing: run `npm install` in tests/" };
+  }
+  const dir = path.join(path.dirname(api), "jsdom/living");
+  if (require.cache[path.join(dir, "window/Location-impl.js")]) {
+    return { ok: false, reason: "jsdom was loaded before tests/harness/thunderbird.js; require the harness first" };
+  }
+  const nav = require(path.join(dir, "window/navigation.js"));
+  const whatwgURL = require(require.resolve("whatwg-url", { paths: [path.dirname(api)] }));
+  const original = nav.navigate;
+  nav.navigate = (window, newURL, flags) => {
+    const hook = window?._fakeNavigate;
+    const href = whatwgURL.serializeURL(newURL);
+    // Fragment-only changes and javascript: URLs stay with jsdom (navigation.js:21-49).
+    const sameDocument = !flags?.reloadTriggered && href.split("#")[0] === String(window?.location?.href).split("#")[0];
+    if (!hook || sameDocument || newURL.scheme === "javascript") return original(window, newURL, flags);
+    return hook(href);
+  };
+  return { ok: true };
+})();
+
 const SRC = process.env.TNOTE_SRC || path.resolve(__dirname, "../../src");
 const UUID = "0c6f3f0e-6b1c-4a59-9d2a-7a1e5e7d0a11";
 const BASE_URL = `moz-extension://${UUID}/`;
@@ -213,9 +252,16 @@ class FakeThunderbird {
       // v0.4.1 opening after 3175 ms (scratchpad
       // tb-integration/v041adv/mn-w41.log, mn-t41.log T1).
       throttledFrameMs: 1000,
+      // A message that mailTabs.setSelectedMessages puts on display finishes
+      // loading at once (false: it starts displaying but stays loading, like a
+      // slow or stalled body, until finishMessageLoad(tab)).
+      displayLoads: true,
       ...config,
     };
 
+    // Every messages.query search, as { folderIds, checked }: the folders it
+    // walked and how many message headers it had to check (see messages.query).
+    this.searches = [];
     this.calls = [];
     this.faults = {};
     this.holds = {};
@@ -355,7 +401,7 @@ class FakeThunderbird {
     return f;
   }
 
-  addMessage({ subject = "Hello", headerMessageId, tags = [], external = false, author = "Ann <ann@example.com>", folder = "Inbox" } = {}) {
+  addMessage({ subject = "Hello", headerMessageId, tags = [], external = false, author = "Ann <ann@example.com>", folder = "Inbox", date } = {}) {
     const id = this.nextMessageId++;
     const m = {
       id,
@@ -365,7 +411,7 @@ class FakeThunderbird {
       headerMessageId: headerMessageId === undefined ? `msg${id}@example.com` : headerMessageId,
       keywords: [...tags],
       external,
-      date: Date.UTC(2026, 9, 1, 9, id),
+      date: date ?? Date.UTC(2026, 9, 1, 9, id),
       read: true,
       flagged: false,
       junk: false,
@@ -381,6 +427,21 @@ class FakeThunderbird {
   deleteMessage(id) {
     this.messages.delete(id);
     for (const t of this.tabs.values()) t.selected = t.selected.filter((x) => x !== id);
+  }
+
+  /**
+   * The user moves a message to another folder. The moved message is a new
+   * header in the destination folder, so it gets a new id: the tracker drops
+   * the source's id on a move (MessageTracker.msgsMoveCopyCompleted,
+   * ExtensionMessages.sys.mjs:1556-1584) and the destination header is
+   * converted afresh. MODEL: subject, author, date, Message-ID and tags
+   * (keywords) travel with the message. Returns the new header.
+   */
+  moveMessage(id, folderName) {
+    const m = this.messages.get(id);
+    if (!m) throw new FakeError(`no message ${id}`);
+    this.deleteMessage(id);
+    return this.addMessage({ subject: m.subject, headerMessageId: m.headerMessageId, tags: m.keywords, author: m.author, folder: folderName, date: m.date });
   }
 
   // ExtensionMessages.sys.mjs:2131-2160 (MessageHeader conversion).
@@ -411,6 +472,8 @@ class FakeThunderbird {
     return h;
   }
 
+  // Tab.convert (ext-mail.js:870-877): type, and in MV2 mailTab = type "mail".
+  // This is also the tab menus.onClicked hands over (ext-menus.js:1465).
   tabInfo(tab) {
     return {
       id: tab.id,
@@ -424,16 +487,18 @@ class FakeThunderbird {
     };
   }
 
-  windowInfo(w) {
-    return {
+  // WindowBase.convert (ext-tabs-base.js:1109-1129): tabs only with populate.
+  windowInfo(w, { populate = true } = {}) {
+    const info = {
       id: w.id,
       focused: w.id === this.topWindowId,
       incognito: false,
       alwaysOnTop: false,
       type: w.type,
       state: w.state,
-      tabs: w.tabIds.map((id) => this.tabInfo(this.tabs.get(id))),
     };
+    if (populate) info.tabs = w.tabIds.map((id) => this.tabInfo(this.tabs.get(id)));
+    return info;
   }
 
   activeTab(windowId) {
@@ -524,11 +589,8 @@ class FakeThunderbird {
   }
 
   jsdom() {
-    try {
-      return require("jsdom");
-    } catch {
-      throw new Error("jsdom is missing: run `npm install` in tests/");
-    }
+    if (!jsdomNavigation.ok) throw new Error(jsdomNavigation.reason);
+    return require("jsdom");
   }
 
   /**
@@ -546,9 +608,15 @@ class FakeThunderbird {
    * current). MODEL: messages sent from that pagehide handler are delivered
    * (each runtime.sendMessage is handed to IPC when called); whether real
    * Thunderbird delivers them during browser teardown is not verified here.
-   * @param {Function} [o.onClose]  chrome-side close (panel hides, tab closes); default: page.hide()
+   *
+   * Navigating (location.href, a followed link) to another page of the add-on
+   * replaces the page in the same browser (see jsdomNavigation): on a later
+   * turn the old page unloads (page.hide) and the new one loads with the same
+   * window, tab and close handling; page.next is the new page.
+   * @param {Function} [o.onClose]     chrome-side close (panel hides, tab closes); default: page.hide()
+   * @param {Function} [o.onNavigate]  (newPage) => void, after a navigation has loaded the new page
    */
-  loadExtensionPage(relUrl, { name, windowId = null, tab = null, onClose = null } = {}) {
+  loadExtensionPage(relUrl, { name, windowId = null, tab = null, onClose = null, onNavigate = null } = {}) {
     const { JSDOM, VirtualConsole } = this.jsdom();
     const url = new URL(relUrl, BASE_URL).href;
     const file = new URL(url).pathname.replace(/^\//, "");
@@ -575,6 +643,24 @@ class FakeThunderbird {
       if (page.closeRequested || page.closed) return;
       page.closeRequested = true;
       setImmediate(() => (onClose ? onClose(page) : page.hide()));
+    };
+    page.navigations = [];
+    page.next = null;
+    win._fakeNavigate = (href) => {
+      if (!href.startsWith(BASE_URL)) {
+        this.violations.push({ api: "navigation", error: `navigating to ${href} is not modelled`, context: name });
+        return;
+      }
+      page.navigations.push(href);
+      // MODEL: the new document arrives on a later turn (a fetch and a new
+      // document); the old one unloads then. A page that has closed by then
+      // goes nowhere.
+      setImmediate(() => {
+        if (this.disposed || page.closed || page.closeRequested) return;
+        page.hide();
+        page.next = this.loadExtensionPage(href, { name, windowId, tab, onClose, onNavigate });
+        onNavigate?.(page.next);
+      });
     };
     // MODEL: window.focus() asks Gecko to raise the page's window and focus the
     // page. Whether that is honoured for an extension panel or content tab
@@ -603,9 +689,11 @@ class FakeThunderbird {
   // a new ViewPopup for popupURL, the URL triggerAction read from the action's
   // context data. `destroyed` mirrors BasePopup.destroy (ExtensionPopups.sys.mjs:70-80),
   // which removes the panel from BasePopup.instances.
+  // `pages` lists every page the panel has shown, in order (the panel's page
+  // can navigate, see loadExtensionPage); `page` is the current one.
   openPopupPanel(kind, windowId, popupUrl) {
     const url = new URL(popupUrl, BASE_URL).href;
-    const record = { kind, windowId, url, loaded: false, dismissed: false, destroyed: false, page: null };
+    const record = { kind, windowId, url, loaded: false, dismissed: false, destroyed: false, page: null, pages: [] };
     this.popups.push(record);
     if (this.config.popupLoads) {
       setImmediate(() => {
@@ -618,11 +706,21 @@ class FakeThunderbird {
             record.destroyed = true;
             page.hide();
           },
+          onNavigate: this.followPages(record),
         });
+        record.pages.push(record.page);
         record.loaded = true;
       });
     }
     return record;
+  }
+
+  /** onNavigate for a popup record: the record follows its browser to the new page. */
+  followPages(record) {
+    return (page) => {
+      record.page = page;
+      record.pages.push(page);
+    };
   }
 
   /** The popup panel of this add-on still open in a window, if any (BasePopup.for, ExtensionPopups.sys.mjs:62-64). */
@@ -1313,21 +1411,51 @@ class FakeThunderbird {
       },
 
       // ---- messages.query (ext-messages.js:1630 -> ExtensionMessages.sys.mjs
-      // MessageQuery, :2221-2440, :2640-2696). MODEL: only the headerMessageId
-      // criterion is modelled. Every account's folder tree is searched (:2366-2372)
-      // and messages whose Message-ID differs are skipped (:2414-2419). The first
-      // page resolves when the search is done (MessageList.done, :1899-1909) or a
-      // page fills up; one page holds every match here, so its id is null.
+      // MessageQuery, :2221-2440, :2637-2696). MODEL: only the headerMessageId
+      // criterion, folderId, includeSubFolders and messagesPerPage are modelled.
+      // - folderId: each id goes through getFolder (:2312-2317), which rejects an
+      //   unknown one with "Folder not found: <id>" (ExtensionAccounts.sys.mjs
+      //   :776-806, :683-704); then the accountsRead permission is required
+      //   (:2351-2357). Only those folders are searched, without subfolders
+      //   unless includeSubFolders (the fake's folders have none).
+      // - without folderId every account's folder tree is searched (:2366-2372).
+      // - every message of every searched folder is checked; a different
+      //   Message-ID is skipped (:2414-2420). The search does not stop at a hit:
+      //   it runs until done() (:2688-2696) or until a page is full and the
+      //   next match arrives (MessageList.addMessage -> addPage, :1860-1883,
+      //   :1817-1844). The first page holds up to messagesPerPage matches
+      //   (default 100, the extensions.webextensions.messagesPerPage pref,
+      //   :41-46), and its id is the list's id while more pages follow, else
+      //   null (getNextUnreadPage, :1917-1930). tb.searches records each search.
+      //   MODEL: the auto-pagination timer (:2645-2660) is not modelled; for a
+      //   Message-ID search each check answers without yielding to timers.
       // Messages opened from a file are in no folder and are never found.
       "messages.query"([q]) {
+        const modelled = new Set(["headerMessageId", "folderId", "includeSubFolders", "messagesPerPage"]);
         for (const [k, v] of Object.entries(q)) {
-          if (v !== null && v !== undefined && k !== "headerMessageId") throw new FakeError(`messages.query criterion ${k} is not modelled`);
+          if (v !== null && v !== undefined && !modelled.has(k)) throw new FakeError(`messages.query criterion ${k} is not modelled`);
         }
         if (!q.headerMessageId) throw new FakeError("the fake models messages.query({ headerMessageId }) only");
-        const ids = tb.folders.flatMap((f) =>
-          [...tb.messages.values()].filter((m) => !m.external && m.folder.id === f.id && m.headerMessageId === q.headerMessageId).map((m) => m.id)
-        );
-        return tb.messageList(ids);
+        let folders = tb.folders;
+        if (q.folderId != null) {
+          folders = [].concat(q.folderId).map((id) => {
+            const f = tb.folders.find((x) => x.id === id);
+            if (!f) throw new ExtensionError(`Folder not found: ${id}`);
+            return f;
+          });
+          if (!tb.builder.hasPermission("accountsRead")) throw new ExtensionError('Querying by folder requires the "accountsRead" permission');
+        }
+        let checked = 0;
+        const ids = folders.flatMap((f) => {
+          const inFolder = [...tb.messages.values()].filter((m) => !m.external && m.folder.id === f.id);
+          checked += inFolder.length;
+          return inFolder.filter((m) => m.headerMessageId === q.headerMessageId).map((m) => m.id);
+        });
+        tb.searches.push({ folderIds: folders.map((f) => f.id), checked });
+        const perPage = q.messagesPerPage ?? 100;
+        const list = tb.messageList(ids.slice(0, perPage));
+        if (ids.length > perPage) list.id = `list-${tb.searches.length}`;
+        return list;
       },
 
       // ---- messageDisplay (ext-messageDisplay.js:172-265)
@@ -1437,7 +1565,7 @@ class FakeThunderbird {
           tab.active = false;
           for (const [id, wasActive] of before) tb.tabs.get(id).active = wasActive;
         }
-        const record = { kind: "tab", windowId: w.id, tabId: tab.id, url, createProperties: props, loaded: false, dismissed: false, page: null };
+        const record = { kind: "tab", windowId: w.id, tabId: tab.id, url, createProperties: props, loaded: false, dismissed: false, page: null, pages: [] };
         tb.popups.push(record);
         if (url.startsWith(BASE_URL) && tb.config.popupLoads) {
           setImmediate(() => {
@@ -1451,7 +1579,9 @@ class FakeThunderbird {
               // closes of a tab the script did not open (greprefs.js:334 sets
               // dom.allow_scripts_to_close_windows to false).
               onClose: () => tb.closeTabPage(record),
+              onNavigate: tb.followPages(record),
             });
+            record.pages.push(record.page);
             record.loaded = true;
           });
         }
@@ -1507,7 +1637,14 @@ class FakeThunderbird {
             tab.folder = msgs[0].folder;
           }
         }
-        tb.selectMessages(msgs.map((m) => m.id), { tab });
+        // threadTree.selectedIndices (:729) fires "select" at once
+        // (tree-view.mjs:1883-1898, :1961-1967), and about:3pane displays a
+        // single selected message (about3Pane.js:5300-5343 ->
+        // message-pane.mjs:306-331 -> aboutMessage.js displayMessage, which
+        // clears msgLoaded); a hidden reading pane displays nothing
+        // (about3Pane.js:5308-5311). Selecting the message already displayed
+        // displays it again. config.displayLoads: whether that load finishes.
+        tb.selectMessages(msgs.map((m) => m.id), { tab, loaded: tb.config.displayLoads });
       },
 
       // ---- windows (ext-windows.js:364-570)
@@ -1530,6 +1667,16 @@ class FakeThunderbird {
         }
         tb.topWindowId = w.id;
         return tb.windowInfo(w);
+      },
+
+      // ext-windows.js:333-341: context.currentWindow, else the top window.
+      // currentWindow is the window holding the page's browser (for an action
+      // popup, the window the panel belongs to), and undefined for the
+      // background page (ExtensionParent.sys.mjs:830-841). MODEL: every window
+      // here has finished loading, so nothing waits for "load".
+      "windows.getCurrent"([getInfo], ctx) {
+        const w = tb.windows.get(ctx.windowId ?? tb.topWindowId);
+        return tb.windowInfo(w, { populate: !!getInfo?.populate });
       },
 
       // ---- actions (ExtensionToolbarButtons.sys.mjs getAPI, :937-1091)
@@ -1560,7 +1707,9 @@ class FakeThunderbird {
     this.disposed = true;
     this.frameWaiters = [];
     this.clock.dispose();
-    for (const p of this.popups) p.page?.destroy();
+    for (const p of this.popups) {
+      for (const page of new Set([...(p.pages || []), p.page])) page?.destroy();
+    }
     for (const p of this.displayPages) p.dom.window.close();
     this.releaseRejections();
   }

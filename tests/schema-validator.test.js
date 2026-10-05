@@ -467,3 +467,140 @@ describe("v0.5.0 APIs: messages.query, mailTabs.setSelectedMessages, messageDisp
     await assert.rejects(m.messageDisplay.open({ headerMessageId: "msg3@example.com", location: "tab" }), { message: "Unknown or invalid headerMessageId: msg3@example.com." });
   });
 });
+
+describe("v0.6.0 fake models: folder-scoped messages.query, windows.getCurrent, page navigation, moves", { skip }, () => {
+  function world(t, manifestPatch) {
+    const tb = worldWith(manifestPatch);
+    t.after(() => tb.dispose());
+    tb.addMessage({ subject: "In the Inbox" });
+    tb.addMessage({ subject: "Archived", folder: "Archives" });
+    tb.addMessage({ subject: "Also in the Inbox" });
+    return { tb, m: api(tb) };
+  }
+
+  it("messages.query with folderId searches only that folder; without, every folder", async (t) => {
+    const { tb, m } = world(t);
+    const hit = await m.messages.query({ folderId: "account1://Archives", headerMessageId: "msg2@example.com" });
+    assert.deepEqual(hit.messages.map((x) => [x.id, x.folder.id]), [[2, "account1://Archives"]]);
+    assert.deepEqual((await m.messages.query({ folderId: "account1://INBOX", headerMessageId: "msg2@example.com" })).messages, []);
+    assert.deepEqual((await m.messages.query({ folderId: ["account1://INBOX", "account1://Archives"], headerMessageId: "msg2@example.com" })).messages.map((x) => x.id), [2]);
+    await m.messages.query({ headerMessageId: "msg2@example.com" });
+    assert.deepEqual(tb.searches, [
+      { folderIds: ["account1://Archives"], checked: 1 },
+      { folderIds: ["account1://INBOX"], checked: 2 },
+      { folderIds: ["account1://INBOX", "account1://Archives"], checked: 3 },
+      { folderIds: ["account1://INBOX", "account1://Archives"], checked: 3 },
+    ]);
+    assert.throws(() => m.messages.query({ folderId: 7, headerMessageId: "x" }), /Incorrect argument types|Expected string/);
+    assert.throws(() => m.messages.query({ messagesPerPage: "1", headerMessageId: "x" }), /Expected integer/);
+  });
+
+  it("messages.query rejects an unknown folder like getFolder, and a folder query without accountsRead", async (t) => {
+    const { m } = world(t);
+    await assert.rejects(m.messages.query({ folderId: "account1://Gone", headerMessageId: "msg1@example.com" }), { message: "Folder not found: account1://Gone" });
+    const { m: noAccounts } = world(t, { permissions: readManifest().permissions.filter((p) => p !== "accountsRead") });
+    await assert.rejects(noAccounts.messages.query({ folderId: "account1://INBOX", headerMessageId: "msg1@example.com" }), {
+      message: 'Querying by folder requires the "accountsRead" permission',
+    });
+    assert.equal((await noAccounts.messages.query({ headerMessageId: "msg1@example.com" })).messages.length, 1, "a query without folder needs no accountsRead");
+  });
+
+  it("messages.query pages: the first page holds messagesPerPage matches, with a list id while more follow", async (t) => {
+    const { tb, m } = world(t);
+    const copy = tb.addMessage({ subject: "Copy", headerMessageId: "msg1@example.com", folder: "Archives" });
+    const one = await m.messages.query({ headerMessageId: "msg1@example.com", messagesPerPage: 1 });
+    assert.deepEqual(one.messages.map((x) => x.id), [1]);
+    assert.equal(typeof one.id, "string", "more pages follow");
+    const all = await m.messages.query({ headerMessageId: "msg1@example.com" });
+    assert.deepEqual([all.id, all.messages.map((x) => x.id)], [null, [1, copy.id]], "default page size 100: one page");
+    const single = await m.messages.query({ headerMessageId: "msg3@example.com", messagesPerPage: 1 });
+    assert.deepEqual([single.id, single.messages.map((x) => x.id)], [null, [3]]);
+    await assert.rejects(m.messages.query({ headerMessageId: "x", fromMe: true }), /not modelled/);
+  });
+
+  it("moveMessage gives the message a new id in the new folder, with its Message-ID, date and tags", (t) => {
+    const { tb } = world(t);
+    tb.messages.get(1).keywords = ["$label1"];
+    const before = tb.header(1);
+    const moved = tb.moveMessage(1, "Archives");
+    assert.notEqual(moved.id, 1);
+    assert.equal(tb.messages.has(1), false);
+    assert.deepEqual(
+      [moved.headerMessageId, moved.subject, moved.date.getTime(), moved.tags, moved.folder.id],
+      [before.headerMessageId, before.subject, before.date.getTime(), ["$label1"], "account1://Archives"]
+    );
+  });
+
+  it("windows.getCurrent answers the window a page is in, or the top window for the background page", async (t) => {
+    const { tb, m } = world(t);
+    const second = tb.openMainWindow();
+    const panelPage = tb.createContext("panel", "addon_child", BASE_URL + "list.html", { windowId: tb.mainWindow.id }).api;
+    assert.deepEqual(await panelPage.windows.getCurrent(), { id: tb.mainWindow.id, focused: false, incognito: false, alwaysOnTop: false, type: "normal", state: "normal" });
+    assert.equal((await m.windows.getCurrent()).id, second.window.id, "background: the top window");
+    assert.deepEqual((await panelPage.windows.getCurrent({ populate: true })).tabs.map((x) => x.id), [tb.mailTab.id]);
+  });
+
+  it("mailTabs.setSelectedMessages displays the message; with displayLoads off it stays loading", async (t) => {
+    const { tb, m } = world(t);
+    await m.mailTabs.setSelectedMessages(tb.mailTab.id, [3]);
+    assert.deepEqual([tb.mailTab.selected, tb.mailTab.msgLoaded], [[3], true]);
+    tb.config.displayLoads = false;
+    await m.mailTabs.setSelectedMessages(tb.mailTab.id, [1]);
+    assert.deepEqual([tb.mailTab.selected, tb.mailTab.msgLoaded], [[1], false]);
+    let shown;
+    m.messageDisplay.getDisplayedMessage(tb.mailTab.id).then((x) => (shown = x));
+    await advance(tb, 60000);
+    assert.equal(shown, undefined, "still loading");
+    tb.finishMessageLoad();
+    await flush();
+    assert.equal(shown.id, 1);
+  });
+
+  it("an extension page that navigates to another of the add-on's pages is replaced in the same panel", async (t) => {
+    const tb = worldWith();
+    t.after(() => tb.dispose());
+    tb.addMessage({ subject: "In the Inbox" });
+    const panel = tb.clickActionButton("browserAction");
+    await flush();
+    const first = panel.page;
+    let hid = 0;
+    first.window.addEventListener("pagehide", () => hid++);
+    first.window.location.href = "note.html?id=1&from=list";
+    assert.equal(panel.page, first, "the new document arrives later");
+    await flush();
+    assert.equal(hid, 1);
+    assert.equal(first.closed, true);
+    assert.equal(first.ctx.closed, true);
+    assert.equal(panel.page.url, BASE_URL + "note.html?id=1&from=list");
+    assert.equal(panel.page.windowId, tb.mainWindow.id);
+    assert.deepEqual(panel.pages.map((p) => p.url), [BASE_URL + "list.html", BASE_URL + "note.html?id=1&from=list"]);
+    assert.equal(panel.destroyed, false);
+    assert.equal(panel.page.document.getElementById("back").hidden, false, "note.js ran in the new page");
+    // A fragment change stays in the page; an outside URL is not modelled.
+    panel.page.window.location.hash = "#x";
+    panel.page.window.location.href = "https://example.com/";
+    await flush();
+    assert.equal(panel.pages.length, 2);
+    assert.deepEqual(tb.violations.map((v) => v.error), ["navigating to https://example.com/ is not modelled"]);
+    assert.deepEqual(tb.consoleMessages.filter((c) => c.level === "jsdomError"), [], "jsdom's own 'not implemented' never shows");
+  });
+
+  it("a page that closes before its navigation lands goes nowhere", async (t) => {
+    const tb = worldWith();
+    t.after(() => tb.dispose());
+    const panel = tb.clickActionButton("browserAction");
+    await flush();
+    panel.page.window.location.href = "note.html";
+    tb.dismissPopup(panel);
+    await flush();
+    assert.deepEqual(panel.pages.map((p) => p.url), [BASE_URL + "list.html"]);
+  });
+
+  it("a fault can be a function of the calling context", async (t) => {
+    const tb = worldWith();
+    t.after(() => tb.dispose());
+    tb.faults["storage.local.get"] = (ctx) => (ctx.name === "flaky" ? new Error("busy") : undefined);
+    await assert.rejects(tb.createContext("flaky", "addon_child", BASE_URL + "x.html").api.storage.local.get(null), { message: "busy" });
+    assert.deepEqual(await api(tb).storage.local.get(null), {});
+  });
+});
