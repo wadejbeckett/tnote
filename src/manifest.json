@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "tNOTE",
   "description": "Right-click a message to add a private note; read it at the top of the message.",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "author": "Noiz",
   "browser_specific_settings": {
     "gecko": {
@@ -17,7 +17,8 @@
     "messagesUpdate",
     "messagesTags",
     "messagesTagsList",
-    "messagesModify"
+    "messagesModify",
+    "accountsRead"
   ],
   "background": {
     "scripts": [
@@ -36,9 +37,9 @@
     "48": "icons/note.svg"
   },
   "browser_action": {
-    "default_title": "tNOTE",
+    "default_title": "All notes",
     "default_label": "tNOTE",
     "default_icon": "icons/note.svg",
-    "default_popup": "note.html"
+    "default_popup": "list.html"
   }
 }

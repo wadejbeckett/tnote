@@ -2,7 +2,7 @@
 
 A small Thunderbird extension: right-click a message, choose **Add note…**, and the note shows as a green bar at the top of that message when you open it. Messages with a note get a green **Note** tag (named **tNOTE** if you already have a tag called Note). Uses only Thunderbird's stable WebExtension APIs, so it should survive Thunderbird updates.
 
-The editor opens as a drop-down panel from the message header's **Note** button or the main toolbar's **tNOTE** button, so it always appears in front. It saves as you type; **Done**, Escape or Ctrl+Enter close it, and **Delete note** removes the note and tag. Either button also opens the editor for the message you are reading. If neither button is available, the editor opens in a tab.
+The message header's **Note** button opens the note for the message you are reading. The main toolbar's **tNOTE** button shows **All notes**, newest first, with search; clicking one jumps to its message. The editor is a drop-down panel, so it always appears in front. It saves as you type; **Done**, Escape or Ctrl+Enter close it, and **Delete note** removes the note and tag. If no panel can open, the editor opens in a tab.
 
 Download `tnote.xpi` from [Releases](https://github.com/wadejbeckett/tnote/releases) or build it with `./build.sh`, then in Thunderbird go to Add-ons and Themes, gear menu, **Install Add-on From File**, and pick `tnote.xpi`. Licensed GPLv3.
 

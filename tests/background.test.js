@@ -15,13 +15,21 @@ const DEFAULT_TAGS = [
 const USER_NOTE_TAG = { key: "note", tag: "Note", color: "#00AA00", ordinal: "" };
 const THREE = [{ subject: "Invoice 42" }, { subject: "Quote for racks" }, { subject: "Lunch?" }];
 const MULTI_TITLE = "Add note (select one message)";
+/** What save() keeps next to a note for the All notes list (v0.5.0); the fake's message n is dated 2026-10-01 09:0n UTC. */
+const infoFor = (id, { subject = "Invoice 42", author = "Ann <ann@example.com>", mid = `msg${id}@example.com` } = {}) => ({
+  subject,
+  author,
+  date: Date.UTC(2026, 9, 1, 9, id),
+  mid,
+});
 
 const send = (tb, msg) => pageApi(tb).runtime.sendMessage(msg);
 const argsOf = (tb, api) => tb.apiCalls(api).map((c) => c.args);
 const editorCalls = (tb) =>
   tb.calls.filter((c) => /openPopup|windows\.create|tabs\.create/.test(c.api)).map((c) => [c.api, c.result]);
-/** The manifest's popup, as Thunderbird stores it (resolved against the add-on). */
-const POPUP_URL = BASE_URL + "note.html";
+/** The manifest's popups, as Thunderbird stores them (resolved against the add-on). */
+const POPUP_URL = BASE_URL + "note.html"; // header Note button
+const LIST_URL = BASE_URL + "list.html"; // toolbar button (v0.5.0: All notes)
 /** setPopup/openPopup calls on both action buttons, in order, from call index `from`. */
 const actionCalls = (tb, from = 0) =>
   tb.calls.slice(from).filter((c) => /Action\.(setPopup|openPopup)$/.test(c.api)).map((c) => [c.api, c.args[0]]);
@@ -32,7 +40,9 @@ async function popupsNow(tb) {
   const api = pageApi(tb, "popup check");
   return { header: await api.messageDisplayAction.getPopup({}), toolbar: await api.browserAction.getPopup({}) };
 }
-const UNCHANGED = { header: POPUP_URL, toolbar: POPUP_URL };
+const UNCHANGED = { header: POPUP_URL, toolbar: LIST_URL };
+/** Notes the All notes list shows in a toolbar panel, as subject lines. */
+const listSubjects = (popup) => [...popup.page.document.querySelectorAll("#list .subject")].map((e) => e.textContent);
 
 function contentApi(tb, tab) {
   return tb.createContext(`content (tab ${tab.id})`, "content_child", "mailbox:///home/user/Inbox?number=1", {
@@ -188,7 +198,7 @@ describe("menu click: opening the editor", { skip }, () => {
     assert.equal(tb.popups[0].url, BASE_URL + "note.html?id=1", "the panel opened the right-clicked message's URL");
     assert.deepEqual(loadRequests(tb), [{ type: "load", id: 1 }], "the editor asked for that message by id");
     assert.equal(popupText(tb.popups[0]).subject, "Invoice 42");
-    assert.deepEqual(await popupsNow(tb), UNCHANGED, "both buttons are back to plain note.html");
+    assert.deepEqual(await popupsNow(tb), UNCHANGED, "both buttons are back to their own pages");
     assertClean(tb);
   });
 
@@ -202,7 +212,7 @@ describe("menu click: opening the editor", { skip }, () => {
     assert.deepEqual(actionCalls(tb), [
       ["browserAction.setPopup", { popup: "note.html?id=3" }],
       ["browserAction.openPopup", { windowId: tb.mainWindow.id }],
-      ["browserAction.setPopup", { popup: "note.html" }],
+      ["browserAction.setPopup", { popup: "list.html" }],
     ]);
     await flush();
     assert.equal(tb.popups.length, 1);
@@ -273,7 +283,7 @@ describe("menu click: opening the editor", { skip }, () => {
     assert.deepEqual(actionCalls(tb), [
       ["browserAction.setPopup", { popup: "note.html?id=3" }],
       ["browserAction.openPopup", { windowId: tb.mainWindow.id }],
-      ["browserAction.setPopup", { popup: "note.html" }],
+      ["browserAction.setPopup", { popup: "list.html" }],
     ]);
     assert.equal(tb.apiCalls("browserAction.openPopup")[0].result, false);
     assert.deepEqual(argsOf(tb, "tabs.create"), [[{ url: "note.html?id=3", windowId: tb.mainWindow.id }]]);
@@ -362,6 +372,7 @@ describe("menu click: opening the editor", { skip }, () => {
   });
 
   it("a toolbar panel that never loaded does not redirect later header or toolbar clicks, with no time passing", async (t) => {
+    // v0.5.0: the toolbar button's own page is the All notes list.
     const { tb, msgs } = await boot(t, { messages: THREE, config: { popupLoads: false } });
     tb.selectMessages([msgs[0].id]);
     await tb.clickMenuItem("mail-note", [msgs[2].id]); // toolbar panel for Lunch?, never loads
@@ -375,8 +386,9 @@ describe("menu click: opening the editor", { skip }, () => {
     tb.dismissPopup(header);
     const toolbar = tb.clickActionButton("browserAction");
     await flush();
-    assert.equal(toolbar.url, POPUP_URL);
-    assert.equal(popupText(toolbar).subject, "Invoice 42");
+    assert.equal(toolbar.url, LIST_URL, "the list, not the stale right-click's editor");
+    assert.equal(toolbar.page.document.getElementById("status").textContent, "No notes yet. Right-click a message and choose Add note…");
+    assert.deepEqual(loadRequests(tb), [{ type: "load", id: null }], "only the header editor asked for a message");
     assert.equal(tb.clock.now(), Date.UTC(2026, 9, 5, 8, 0, 0), "no fake time passed");
     assertClean(tb);
   });
@@ -422,7 +434,7 @@ describe("right-click hands the message to the panel in its URL (v0.4.1)", { ski
     held.release();
     await clicked;
     await flush();
-    assert.deepEqual(actionCalls(tb).at(-1), ["browserAction.setPopup", { popup: "note.html" }]);
+    assert.deepEqual(actionCalls(tb).at(-1), ["browserAction.setPopup", { popup: "list.html" }]);
     assert.equal(tb.popups[0].url, BASE_URL + "note.html?id=3");
     assert.equal(popupText(tb.popups[0]).subject, "Lunch?");
     assert.deepEqual(await popupsNow(tb), UNCHANGED);
@@ -440,7 +452,7 @@ describe("right-click hands the message to the panel in its URL (v0.4.1)", { ski
       ["messageDisplayAction.setPopup", { popup: "note.html" }],
       ["browserAction.setPopup", { popup: "note.html?id=1" }],
       ["browserAction.openPopup", { windowId: tb.mainWindow.id }],
-      ["browserAction.setPopup", { popup: "note.html" }],
+      ["browserAction.setPopup", { popup: "list.html" }],
     ]);
     assert.equal(tb.apiCalls("messageDisplayAction.openPopup")[0].rejected, "panel failed");
     assert.equal(tb.apiCalls("browserAction.openPopup")[0].result, false);
@@ -463,19 +475,25 @@ describe("right-click hands the message to the panel in its URL (v0.4.1)", { ski
     assertClean(tb);
   });
 
-  it("a toolbar click right after a right-click edits the selected message (reading pane hidden)", async (t) => {
+  it("a toolbar click right after a right-click opens the All notes list, not the right-clicked message's editor (reading pane hidden)", async (t) => {
+    // Until v0.4.2 the toolbar button opened the editor for the selected
+    // message; since v0.5.0 its own page is the list, and a right-click only
+    // borrows it for the one openPopup call.
     const { tb, msgs } = await boot(t, { messages: THREE });
     tb.setMessagePaneVisible(false);
     tb.selectMessages([msgs[0].id]);
     await tb.clickMenuItem("mail-note", [msgs[2].id]);
     await flush();
     assert.equal(popupText(tb.popups[0]).subject, "Lunch?");
-    tb.dismissPopup(tb.popups[0]);
+    tb.popups[0].page.document.getElementById("text").value = "Book a table";
+    tb.popups[0].page.document.getElementById("done").click();
+    await flush();
+    assert.equal(tb.popups[0].page.closed, true);
     const toolbar = tb.clickActionButton("browserAction");
     await flush();
-    assert.equal(toolbar.url, POPUP_URL);
-    assert.deepEqual(loadRequests(tb).at(-1), { type: "load", id: null });
-    assert.equal(popupText(toolbar).subject, "Invoice 42", "the selected message, not the right-clicked one");
+    assert.equal(toolbar.url, LIST_URL);
+    assert.deepEqual(loadRequests(tb), [{ type: "load", id: 3 }], "the list asks for no editor message");
+    assert.deepEqual(listSubjects(toolbar), ["Lunch?"], "the list shows the note just added");
     assertClean(tb);
   });
 
@@ -613,11 +631,12 @@ describe("setPopup is not awaited, so a stalled answer cannot hold up the editor
       ["messageDisplayAction.setPopup", { popup: "note.html" }],
       ["browserAction.setPopup", { popup: "note.html?id=3" }],
       ["browserAction.openPopup", { windowId: tb.mainWindow.id }],
-      ["browserAction.setPopup", { popup: "note.html" }],
+      ["browserAction.setPopup", { popup: "list.html" }],
     ]);
     assert.deepEqual([...setPopupAnswers(tb, "messageDisplayAction"), ...setPopupAnswers(tb, "browserAction")], [undefined, undefined, undefined, undefined]);
     assert.deepEqual(await popupsNow(tb), UNCHANGED);
-    // A user click on either button now opens plain note.html: the displayed message.
+    // A user click on either button now opens its own page: the header button
+    // plain note.html (the displayed message), the toolbar button the list.
     tb.dismissPopup(tb.popups[1]);
     const header = tb.clickActionButton("messageDisplayAction");
     await flush();
@@ -626,8 +645,8 @@ describe("setPopup is not awaited, so a stalled answer cannot hold up the editor
     tb.dismissPopup(header);
     const toolbar = tb.clickActionButton("browserAction");
     await flush();
-    assert.equal(toolbar.url, POPUP_URL);
-    assert.equal(popupText(toolbar).subject, "Invoice 42");
+    assert.equal(toolbar.url, LIST_URL);
+    assert.equal(toolbar.page.document.getElementById("search"), toolbar.page.document.activeElement, "the list page ran");
     assert.equal(tb.clock.now(), START);
     assertClean(tb);
   });
@@ -647,7 +666,7 @@ describe("setPopup is not awaited, so a stalled answer cannot hold up the editor
       ["messageDisplayAction.setPopup", { popup: "note.html" }],
       ["browserAction.setPopup", { popup: "note.html?id=1" }],
       ["browserAction.openPopup", { windowId: tb.mainWindow.id }],
-      ["browserAction.setPopup", { popup: "note.html" }],
+      ["browserAction.setPopup", { popup: "list.html" }],
     ]);
     assert.deepEqual(argsOf(tb, "tabs.create"), [[{ url: "note.html?id=1", windowId: tb.mainWindow.id }]]);
     const editor = tb.popups.find((p) => p.kind === "tab");
@@ -731,10 +750,13 @@ describe("a slow or stalled message display does not hold up the editor (v0.4.1)
     assertClean(tb);
   });
 
-  it("a toolbar click finds the selected message after 1 s when the display never finishes", async (t) => {
+  it("a header button click finds the selected message after 1 s when the display never finishes", async (t) => {
+    // Until v0.4.2 this was the toolbar button; since v0.5.0 the header button
+    // is the only button that opens note.html without an id.
     const { tb, msgs } = await boot(t, { messages: THREE });
     tb.selectMessages([msgs[1].id], { loaded: false });
-    const popup = tb.clickActionButton("browserAction");
+    const popup = tb.clickActionButton("messageDisplayAction");
+    assert.equal(popup.url, POPUP_URL);
     await flush();
     const text = () => popup.page.document.getElementById("text");
     assert.equal(text().disabled, true, "nothing to edit yet");
@@ -846,7 +868,11 @@ describe("\"save\" request", { skip }, () => {
   it("stores trimmed text under note:<Message-ID> and adds the tag, keeping other tags", async (t) => {
     const { tb, msgs } = await boot(t, { messages: [{ subject: "Invoice 42", tags: ["$label1"] }] });
     assert.equal(await send(tb, { type: "save", id: msgs[0].id, text: "  Waiting for PO 7781 \n" }), true);
-    assert.deepEqual([...tb.storage], [["note:msg1@example.com", "Waiting for PO 7781"]]);
+    assert.deepEqual([...tb.storage], [
+      ["note:msg1@example.com", "Waiting for PO 7781"],
+      ["info:msg1@example.com", infoFor(1)],
+    ]);
+    assert.deepEqual(argsOf(tb, "storage.local.set"), [[{ "note:msg1@example.com": "Waiting for PO 7781", "info:msg1@example.com": infoFor(1) }]], "note and info in one write");
     assert.deepEqual(tagsOf(tb, msgs[0].id), ["$label1", "mailnote"]);
     assertClean(tb);
   });
@@ -895,7 +921,7 @@ describe("\"save\" request", { skip }, () => {
     // different message after a restart.
     const { tb, msgs } = await boot(t, { messages: [{ subject: "No id", headerMessageId: "" }] });
     await send(tb, { type: "save", id: msgs[0].id, text: "x" });
-    assert.deepEqual([...tb.storage.keys()], ["note:id:1"]);
+    assert.deepEqual(Object.fromEntries(tb.storage), { "note:id:1": "x", "info:id:1": infoFor(1, { subject: "No id", mid: "" }) });
     assert.deepEqual(tagsOf(tb, msgs[0].id), ["mailnote"]);
     assertClean(tb);
   });
@@ -975,6 +1001,58 @@ describe("\"save\" request", { skip }, () => {
   });
 });
 
+describe("\"info:\" kept next to each note for the All notes list (v0.5.0)", { skip }, () => {
+  it("adding a note writes info:<Message-ID> with subject, author, date (ms) and Message-ID, in the same write", async (t) => {
+    const { tb, msgs } = await boot(t, { messages: [{ subject: "Quote for racks", author: "Bob <bob@racks.example>" }] });
+    await send(tb, { type: "save", id: msgs[0].id, text: "Chase Bob" });
+    assert.deepEqual(argsOf(tb, "storage.local.set"), [
+      [{ "note:msg1@example.com": "Chase Bob", "info:msg1@example.com": infoFor(1, { subject: "Quote for racks", author: "Bob <bob@racks.example>" }) }],
+    ]);
+    assert.equal(typeof tb.storage.get("info:msg1@example.com").date, "number", "the date is stored as a number, not a Date");
+    assertClean(tb);
+  });
+
+  it("editing rewrites the info from the message as it is now", async (t) => {
+    const { tb, msgs } = await boot(t, {
+      storage: { "note:msg1@example.com": "old", "info:msg1@example.com": { subject: "stale", author: "", date: 0, mid: "msg1@example.com" } },
+    });
+    await send(tb, { type: "save", id: msgs[0].id, text: "new" });
+    assert.deepEqual(Object.fromEntries(tb.storage), { "note:msg1@example.com": "new", "info:msg1@example.com": infoFor(1) });
+    assertClean(tb);
+  });
+
+  it("deleting a note removes the note and its info in one call, and leaves other notes alone", async (t) => {
+    const { tb, msgs } = await boot(t, {
+      messages: THREE,
+      storage: {
+        "note:msg1@example.com": "old",
+        "info:msg1@example.com": infoFor(1),
+        "note:msg2@example.com": "keep",
+        "info:msg2@example.com": infoFor(2, { subject: "Quote for racks" }),
+      },
+    });
+    await send(tb, { type: "save", id: msgs[0].id, text: "  " });
+    assert.deepEqual(argsOf(tb, "storage.local.remove"), [[["note:msg1@example.com", "info:msg1@example.com"]]]);
+    assert.deepEqual(Object.fromEntries(tb.storage), { "note:msg2@example.com": "keep", "info:msg2@example.com": infoFor(2, { subject: "Quote for racks" }) });
+    assertClean(tb);
+  });
+
+  it("deleting a note saved before v0.5.0 (no info) works", async (t) => {
+    const { tb, msgs } = await boot(t, { storage: { "note:msg1@example.com": "old" } });
+    assert.equal(await send(tb, { type: "save", id: msgs[0].id, text: "" }), true);
+    assert.equal(tb.storage.size, 0);
+    assertClean(tb);
+  });
+
+  it("a note that cannot be stored leaves no info behind either", async (t) => {
+    const { tb, msgs } = await boot(t);
+    tb.faults["storage.local.set"] = new Error("disk full");
+    await assert.rejects(send(tb, { type: "save", id: msgs[0].id, text: "x" }), /disk full/);
+    assert.equal(tb.storage.size, 0);
+    assertClean(tb);
+  });
+});
+
 describe("saves run one at a time (v0.4.1)", { skip }, () => {
   /** The background's storage and tag writes, in the order Thunderbird got them. */
   const writes = (tb) =>
@@ -995,10 +1073,10 @@ describe("saves run one at a time (v0.4.1)", { skip }, () => {
       writes({ calls: tb.calls.slice(from) }),
       [
         ["messages.get"],
-        ["storage.local.set", { "note:msg1@example.com": "Call Bob" }],
+        ["storage.local.set", { "note:msg1@example.com": "Call Bob", "info:msg1@example.com": infoFor(1) }],
         ["messages.update", ["$label2", "mailnote"]],
         ["messages.get"],
-        ["storage.local.remove", "note:msg1@example.com"],
+        ["storage.local.remove", ["note:msg1@example.com", "info:msg1@example.com"]],
         ["messages.update", ["$label2"]],
       ],
       "the clear starts only after the add has finished"
@@ -1019,7 +1097,7 @@ describe("saves run one at a time (v0.4.1)", { skip }, () => {
     await flush();
     assert.deepEqual(
       writes({ calls: tb.calls.slice(from) }),
-      [["messages.get"], ["storage.local.set", { "note:msg1@example.com": "Call Bob" }]],
+      [["messages.get"], ["storage.local.set", { "note:msg1@example.com": "Call Bob", "info:msg1@example.com": infoFor(1) }]],
       "the clear has not started while the add is busy"
     );
     slow.release();
@@ -1047,8 +1125,11 @@ describe("saves run one at a time (v0.4.1)", { skip }, () => {
     assert.deepEqual(results, [true, true, true]);
     assert.deepEqual(Object.fromEntries(tb.storage), {
       "note:msg1@example.com": "note 1",
+      "info:msg1@example.com": infoFor(1, { subject: "Invoice 42" }),
       "note:msg2@example.com": "note 2",
+      "info:msg2@example.com": infoFor(2, { subject: "Quote for racks" }),
       "note:msg3@example.com": "note 3",
+      "info:msg3@example.com": infoFor(3, { subject: "Lunch?" }),
     });
     for (const m of msgs) assert.deepEqual(tagsOf(tb, m.id), ["mailnote"]);
     assertClean(tb);

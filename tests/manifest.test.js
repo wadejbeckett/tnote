@@ -110,6 +110,7 @@ describe("manifest.json", { skip }, () => {
     assert.deepEqual(js.filter((f) => !known.has(f)), []);
     assert.equal(known.get("display.js"), "content_child");
     assert.equal(known.get("note.js"), "addon_child");
+    assert.equal(known.get("list.js"), "addon_child", "the toolbar button's All notes page (v0.5.0)");
   });
 
   it("every API the source uses exists in its context and is covered by the manifest permissions", (t) => {
@@ -127,6 +128,38 @@ describe("manifest.json", { skip }, () => {
       "background.js (addon_child): messages.tags.create -> messages.tags.create needs permission messagesTags",
       "background.js (addon_child): messages.tags.update -> messages.tags.update needs permission messagesTags",
     ]);
+  });
+
+  it("asks for accountsRead, a permission Thunderbird's manifest schema knows (v0.5.0)", () => {
+    const m = readManifest();
+    assert.ok(m.permissions.includes("accountsRead"));
+    assert.equal(new Set(m.permissions).size, m.permissions.length, "no permission listed twice");
+    // The same manifest with a misspelt permission is reported, so the clean
+    // validation above really covers accountsRead.
+    const typo = { ...m, permissions: m.permissions.map((p) => (p === "accountsRead" ? "accountRead" : p)) };
+    const { warnings } = validateManifest(typo);
+    assert.equal(warnings.length, 1, warnings.join("\n"));
+    assert.match(warnings[0], /accountRead/);
+  });
+
+  it("negative control: without accountsRead the static scan still passes, but mailTabs.setSelectedMessages rejects at run time", async (t) => {
+    // The schema lists ["messagesRead", "accountsRead"] for setSelectedMessages,
+    // and an entry is injected when any one of its permissions is granted, so
+    // the scan cannot catch this; the implementation checks both
+    // (ext-mailTabs.js:641-648). The list then falls back to opening a tab.
+    const m = readManifest();
+    m.permissions = m.permissions.filter((p) => p !== "accountsRead");
+    assert.deepEqual(scan(m).problems, []);
+    const tb = new FakeThunderbird({ manifest: m });
+    t.after(() => tb.dispose());
+    const api = tb.createContext("no accountsRead", "addon_child", BASE_URL + "list.html").api;
+    await assert.rejects(api.mailTabs.setSelectedMessages(tb.mailTab.id, []), {
+      message: 'Using mailTabs.setSelectedMessages() requires the "accountsRead" and the "messagesRead" permission',
+    });
+    const full = new FakeThunderbird();
+    t.after(() => full.dispose());
+    const ok = full.createContext("with accountsRead", "addon_child", BASE_URL + "list.html").api;
+    assert.equal(await ok.mailTabs.setSelectedMessages(full.mailTab.id, []), undefined);
   });
 
   it("tnote.xpi contains exactly the current src/ files plus LICENSE", (t) => {

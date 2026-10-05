@@ -180,13 +180,13 @@ describe("action button popups (model of ExtensionToolbarButtons.sys.mjs)", { sk
     const tb = worldWith();
     t.after(() => tb.dispose());
     const m = api(tb);
-    assert.equal(await m.browserAction.getPopup({}), BASE_URL + "note.html", "manifest default_popup, resolved");
+    assert.equal(await m.browserAction.getPopup({}), BASE_URL + "list.html", "manifest default_popup, resolved");
     await m.browserAction.setPopup({ popup: "note.html?id=7" });
     assert.equal(await m.browserAction.getPopup({}), BASE_URL + "note.html?id=7");
     assert.equal(await m.browserAction.getPopup({ tabId: tb.mailTab.id }), BASE_URL + "note.html?id=7", "tabs inherit the global value");
     assert.equal(await m.messageDisplayAction.getPopup({}), BASE_URL + "note.html", "the other button is separate");
     await m.browserAction.setPopup({ popup: null });
-    assert.equal(await m.browserAction.getPopup({}), BASE_URL + "note.html");
+    assert.equal(await m.browserAction.getPopup({}), BASE_URL + "list.html");
     // A page in a subfolder resolves against itself (:1006-1010).
     const sub = tb.createContext("sub page", "addon_child", BASE_URL + "pages/x.html").api;
     await sub.browserAction.setPopup({ popup: "note.html" });
@@ -256,7 +256,7 @@ describe("action button popups (model of ExtensionToolbarButtons.sys.mjs)", { sk
     await m.browserAction.setPopup({ popup: "note.html?id=9" });
     assert.equal(await m.browserAction.openPopup({}), true);
     assert.equal(tb.popups.length, 1);
-    assert.equal(tb.popups[0].url, BASE_URL + "note.html");
+    assert.equal(tb.popups[0].url, BASE_URL + "list.html", "the first panel, opened on the manifest's popup");
     tb.dismissPopup(tb.popups[0]);
     assert.equal(await m.browserAction.openPopup({}), true);
     assert.equal(tb.popups.at(-1).url, BASE_URL + "note.html?id=9");
@@ -293,7 +293,7 @@ describe("when setPopup answers (model of updateOnChange and animation frames)",
     const m = api(tb);
     const ba = track(m.browserAction.setPopup({ popup: "note.html?id=1" }));
     const mda = track(m.messageDisplayAction.setPopup({ popup: "note.html?id=1" }));
-    assert.equal(tb.popupUrl("browserAction"), BASE_URL + "note.html", "not yet: the call is still on its way to the parent");
+    assert.equal(tb.popupUrl("browserAction"), BASE_URL + "list.html", "not yet: the call is still on its way to the parent");
     await flush(1);
     assert.equal(tb.popupUrl("browserAction"), BASE_URL + "note.html?id=1");
     assert.equal(tb.popupUrl("messageDisplayAction"), BASE_URL + "note.html?id=1");
@@ -398,5 +398,72 @@ describe("when setPopup answers (model of updateOnChange and animation frames)",
     } finally {
       tb.dispose();
     }
+  });
+});
+
+describe("v0.5.0 APIs: messages.query, mailTabs.setSelectedMessages, messageDisplay.open (fake models)", { skip }, () => {
+  function world(t) {
+    const tb = worldWith();
+    t.after(() => tb.dispose());
+    tb.addMessage({ subject: "In the Inbox" });
+    tb.addMessage({ subject: "Archived", folder: "Archives" });
+    tb.addMessage({ subject: "Opened from a file", external: true });
+    return { tb, m: api(tb) };
+  }
+
+  it("calls are checked against the real schemas", (t) => {
+    const { tb, m } = world(t);
+    assert.throws(() => m.messages.query({ headerMessageId: 7 }), /Expected string instead of 7/);
+    assert.throws(() => m.mailTabs.setSelectedMessages(tb.mailTab.id, 1), /Incorrect argument types for mailTabs\.setSelectedMessages/);
+    assert.throws(() => m.messageDisplay.open({ messageId: 1, location: "sidebar" }), /Invalid enumeration value "sidebar"/);
+    assert.equal(tb.violations.length, 3);
+  });
+
+  it("messages.query finds a Message-ID in every folder, with the folder, and never an opened file", async (t) => {
+    const { tb, m } = world(t);
+    const hit = await m.messages.query({ headerMessageId: "msg2@example.com" });
+    assert.equal(hit.id, null, "a single page");
+    assert.deepEqual(hit.messages.map((x) => [x.id, x.subject, x.folder.name]), [[2, "Archived", "Archives"]]);
+    assert.deepEqual((await m.messages.query({ headerMessageId: "msg3@example.com" })).messages, []);
+    assert.deepEqual((await m.messages.query({ headerMessageId: "nope@example.com" })).messages, []);
+    await assert.rejects(m.messages.query({ subject: "x" }), /not modelled/);
+    tb.deleteMessage(1);
+    assert.deepEqual((await m.messages.query({ headerMessageId: "msg1@example.com" })).messages, []);
+  });
+
+  it("mailTabs.setSelectedMessages selects in view, switches folder when needed, and fails like Thunderbird", async (t) => {
+    const { tb, m } = world(t);
+    await m.mailTabs.setSelectedMessages(tb.mailTab.id, [1]);
+    assert.deepEqual([tb.mailTab.folder.name, tb.mailTab.selected], ["Inbox", [1]]);
+    await m.mailTabs.setSelectedMessages(undefined, [2]); // the active tab
+    assert.deepEqual([tb.mailTab.folder.name, tb.mailTab.selected], ["Archives", [2]]);
+    await m.mailTabs.setSelectedMessages(tb.mailTab.id, []);
+    assert.deepEqual(tb.mailTab.selected, []);
+    await assert.rejects(m.mailTabs.setSelectedMessages(tb.mailTab.id, [1, 2]), /not in the same folder and are also not in the current view/);
+    await assert.rejects(m.mailTabs.setSelectedMessages(99, [1]), { message: "Invalid tab ID: 99" });
+    const content = tb.addTab(tb.mainWindow.id, "content");
+    await assert.rejects(m.mailTabs.setSelectedMessages(content.id, [1]), { message: `Invalid mail tab ID: ${content.id}` });
+    tb.selectTab(tb.mailTab);
+    tb.unviewable.add(tb.folder("Inbox").id);
+    await assert.rejects(m.mailTabs.setSelectedMessages(tb.mailTab.id, [1]), /not viewable in any of the enabled folder modes/);
+    assert.equal(tb.mailTab.folder.name, "Archives", "a failed switch leaves the folder as it was");
+  });
+
+  it("messageDisplay.open opens a message tab (or window) and answers with it", async (t) => {
+    const { tb, m } = world(t);
+    const tab = await m.messageDisplay.open({ messageId: 2, location: "tab" });
+    assert.equal(tab.type, "messageDisplay");
+    assert.equal(tab.windowId, tb.mainWindow.id);
+    assert.equal(tab.active, true);
+    assert.deepEqual(tb.tabs.get(tab.id).selected, [2]);
+    const bg = await m.messageDisplay.open({ headerMessageId: "msg1@example.com", location: "tab", active: false });
+    assert.equal(bg.active, false);
+    assert.equal(tb.activeTab(tb.mainWindow.id).id, tab.id, "a background tab leaves the selected one");
+    const win = await m.messageDisplay.open({ messageId: 1, location: "window" });
+    assert.equal(tb.windows.get(win.windowId).type, "messageDisplay");
+    await assert.rejects(m.messageDisplay.open({ location: "tab" }), { message: "Exactly one of messageId, headerMessageId or file must be specified." });
+    await assert.rejects(m.messageDisplay.open({ messageId: 1, headerMessageId: "msg1@example.com", location: "tab" }), /Exactly one/);
+    await assert.rejects(m.messageDisplay.open({ messageId: 42, location: "tab" }), { message: "Unknown or invalid messageId: 42." });
+    await assert.rejects(m.messageDisplay.open({ headerMessageId: "msg3@example.com", location: "tab" }), { message: "Unknown or invalid headerMessageId: msg3@example.com." });
   });
 });

@@ -36,7 +36,8 @@ messenger.menus.onShown.addListener(async (info) => {
 // always appears in front. A separate popup window would open behind Thunderbird
 // on desktops with focus-stealing prevention (Cinnamon), so the last resort is a
 // tab in the same window instead.
-const POPUP = "note.html";
+const POPUP = "note.html"; // header Note button: this message's note
+const LIST = "list.html"; // toolbar tNOTE button: all notes
 
 // Thunderbird reads the popup URL when the panel opens, so pointing it at this
 // message just for the call hands the panel its id with no shared state.
@@ -45,14 +46,14 @@ const POPUP = "note.html";
 // applied as soon as the call arrives, ahead of the openPopup call behind it.
 const warn = (e) => console.warn("tNOTE:", e);
 
-async function openPanel(action, url, opts) {
+async function openPanel(action, url, opts, reset) {
   action.setPopup({ popup: url }).catch(warn);
   try {
     return await action.openPopup(opts);
   } catch {
     return false;
   } finally {
-    action.setPopup({ popup: POPUP }).catch(warn);
+    action.setPopup({ popup: reset }).catch(warn);
   }
 }
 
@@ -74,8 +75,8 @@ messenger.menus.onClicked.addListener(async (info, tab) => {
   // the message that was right-clicked; otherwise use the main toolbar button.
   const shown = tab ? await displayedMessage(tab.id) : null;
   const opened =
-    (shown?.id === msg.id && (await openPanel(messenger.messageDisplayAction, url, opts))) ||
-    (await openPanel(messenger.browserAction, url, opts));
+    (shown?.id === msg.id && (await openPanel(messenger.messageDisplayAction, url, opts, POPUP))) ||
+    (await openPanel(messenger.browserAction, url, opts, LIST));
   if (!opened) messenger.tabs.create({ url, windowId: tab?.windowId });
 });
 
@@ -120,8 +121,16 @@ async function save(req) {
   const m = await messenger.messages.get(req.id);
   const key = keyFor(m);
   const text = req.text.trim();
-  if (text) await messenger.storage.local.set({ [key]: text });
-  else await messenger.storage.local.remove(key);
+  // "info:" keeps what the All notes list shows, so it needn't search for messages.
+  const info = "info:" + key.slice(5);
+  if (text) {
+    await messenger.storage.local.set({
+      [key]: text,
+      [info]: { subject: m.subject, author: m.author, date: m.date?.getTime?.() ?? m.date, mid: m.headerMessageId },
+    });
+  } else {
+    await messenger.storage.local.remove([key, info]);
+  }
   // The note is safe once stored; tagging is best effort. Messages opened from a
   // file have no folder and can't be tagged at all.
   if (!m.external) {

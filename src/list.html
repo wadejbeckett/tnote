@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>All notes</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: menu; margin: 0; width: 420px; }
+  #search { box-sizing: border-box; width: calc(100% - 24px); margin: 12px; font: inherit; padding: 5px 6px; }
+  ul { list-style: none; margin: 0; padding: 0 0 6px; max-height: 420px; overflow-y: auto; }
+  li { padding: 7px 12px; cursor: pointer; border-left: 3px solid transparent; }
+  li:hover, li:focus { background: color-mix(in srgb, #2E8B57 14%, Canvas); border-left-color: #2E8B57; outline: none; }
+  .top { display: flex; gap: 8px; }
+  .subject { flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .date, .from { opacity: .7; white-space: nowrap; }
+  .from { overflow: hidden; text-overflow: ellipsis; font-size: 92%; }
+  .note { margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status { padding: 4px 12px 12px; opacity: .7; }
+  #status:empty { display: none; }
+</style></head>
+<body>
+  <input id="search" type="search" placeholder="Search notes" aria-label="Search notes">
+  <ul id="list"></ul>
+  <div id="status" role="status"></div>
+  <script src="list.js"></script>
+</body></html>

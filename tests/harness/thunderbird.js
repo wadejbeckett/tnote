@@ -53,6 +53,17 @@ const INBOX = {
   isVirtual: false,
 };
 
+// MODEL: a second folder of the same account, for messages filed elsewhere
+// (the All notes list switches the mail tab to a message's folder).
+const ARCHIVES = {
+  ...INBOX,
+  id: "account1://Archives",
+  name: "Archives",
+  path: "/Archives",
+  specialUse: ["archives"],
+  type: "archives",
+};
+
 /** Gecko's ExtensionError reaches the extension as a plain Error with this message. */
 class ExtensionError extends Error {}
 
@@ -224,6 +235,11 @@ class FakeThunderbird {
     this.storage = new Map();
     this.tags = structuredClone(DEFAULT_TAGS);
     this.messages = new Map();
+    // Folders in search order (MessageQuery.searchFolders walks the accounts'
+    // folder trees, ExtensionMessages.sys.mjs:2366-2372, :2688-2696). Folder ids in
+    // unviewable have no row in any enabled folder mode.
+    this.folders = [structuredClone(INBOX), structuredClone(ARCHIVES)];
+    this.unviewable = new Set();
     this.nextMessageId = 1; // ExtensionMessages.sys.mjs:1102, 1316: a per-session counter.
     this.windows = new Map();
     this.tabs = new Map();
@@ -260,6 +276,9 @@ class FakeThunderbird {
     const t = { id: this.nextTabId++, windowId, type, active: true, selected: [], url: null, msgLoaded: true, loadWaiters: [], ...extra };
     // A mail tab's reading pane (about:3pane message pane) starts out shown.
     if (type === "mail" && t.messagePaneVisible === undefined) t.messagePaneVisible = true;
+    // MODEL: a mail tab shows one folder (the Inbox to start with), all of whose
+    // messages are in its view (no quick filter or collapsed-thread modelling).
+    if (type === "mail" && t.folder === undefined) t.folder = this.folders[0];
     const w = this.windows.get(windowId);
     for (const other of w.tabIds) this.tabs.get(other).active = false;
     w.tabIds.push(t.id);
@@ -329,12 +348,20 @@ class FakeThunderbird {
     this.scheduleFrames();
   }
 
-  addMessage({ subject = "Hello", headerMessageId, tags = [], external = false, author = "Ann <ann@example.com>" } = {}) {
+  /** A folder by name ("Inbox", "Archives"). */
+  folder(name) {
+    const f = this.folders.find((x) => x.name === name);
+    if (!f) throw new FakeError(`no folder ${name}`);
+    return f;
+  }
+
+  addMessage({ subject = "Hello", headerMessageId, tags = [], external = false, author = "Ann <ann@example.com>", folder = "Inbox" } = {}) {
     const id = this.nextMessageId++;
     const m = {
       id,
       subject,
       author,
+      folder: this.folder(folder),
       headerMessageId: headerMessageId === undefined ? `msg${id}@example.com` : headerMessageId,
       keywords: [...tags],
       external,
@@ -345,6 +372,15 @@ class FakeThunderbird {
     };
     this.messages.set(id, m);
     return this.header(id);
+  }
+
+  /**
+   * The message is deleted (expunged): it is gone from its folder, so
+   * messages.get and messages.query no longer find it.
+   */
+  deleteMessage(id) {
+    this.messages.delete(id);
+    for (const t of this.tabs.values()) t.selected = t.selected.filter((x) => x !== id);
   }
 
   // ExtensionMessages.sys.mjs:2131-2160 (MessageHeader conversion).
@@ -371,7 +407,7 @@ class FakeThunderbird {
       external: m.external,
       priority: "none",
     };
-    if (!m.external) h.folder = structuredClone(INBOX);
+    if (!m.external) h.folder = structuredClone(m.folder);
     return h;
   }
 
@@ -1276,6 +1312,24 @@ class FakeThunderbird {
         }
       },
 
+      // ---- messages.query (ext-messages.js:1630 -> ExtensionMessages.sys.mjs
+      // MessageQuery, :2221-2440, :2640-2696). MODEL: only the headerMessageId
+      // criterion is modelled. Every account's folder tree is searched (:2366-2372)
+      // and messages whose Message-ID differs are skipped (:2414-2419). The first
+      // page resolves when the search is done (MessageList.done, :1899-1909) or a
+      // page fills up; one page holds every match here, so its id is null.
+      // Messages opened from a file are in no folder and are never found.
+      "messages.query"([q]) {
+        for (const [k, v] of Object.entries(q)) {
+          if (v !== null && v !== undefined && k !== "headerMessageId") throw new FakeError(`messages.query criterion ${k} is not modelled`);
+        }
+        if (!q.headerMessageId) throw new FakeError("the fake models messages.query({ headerMessageId }) only");
+        const ids = tb.folders.flatMap((f) =>
+          [...tb.messages.values()].filter((m) => !m.external && m.folder.id === f.id && m.headerMessageId === q.headerMessageId).map((m) => m.id)
+        );
+        return tb.messageList(ids);
+      },
+
       // ---- messageDisplay (ext-messageDisplay.js:172-265)
       "messageDisplay.getDisplayedMessage"([tabId]) {
         let tab;
@@ -1296,6 +1350,46 @@ class FakeThunderbird {
           return new Promise((resolve) => tab.loadWaiters.push(() => resolve(displayed())));
         }
         return displayed();
+      },
+
+      // ext-messageDisplay.js:273-342 with getMsgHdr (:77-94). A tab goes into the
+      // given normal window, else the top normal window (getNormalWindowReady,
+      // ext-mail.js:1653-1665); the call answers once the message has loaded
+      // ("MsgLoaded"). MODEL: the message loads at once; location must be
+      // given (the default comes from a pref that is not modelled).
+      "messageDisplay.open"([props], ctx) {
+        const given = ["messageId", "headerMessageId", "file"].filter((k) => props[k]);
+        if (given.length != 1) throw new ExtensionError("Exactly one of messageId, headerMessageId or file must be specified.");
+        if (props.file) throw new FakeError("messageDisplay.open({ file }) is not modelled");
+        let m;
+        if (props.headerMessageId) {
+          m = [...tb.messages.values()].find((x) => !x.external && x.headerMessageId === props.headerMessageId);
+          if (!m) throw new ExtensionError(`Unknown or invalid headerMessageId: ${props.headerMessageId}.`);
+        } else {
+          m = tb.messages.get(props.messageId);
+          if (!m) throw new ExtensionError(`Unknown or invalid messageId: ${props.messageId}.`);
+        }
+        if (!props.location) throw new FakeError("messageDisplay.open without location (user preference) is not modelled");
+        if (props.location === "window") return tb.tabInfo(tb.openMessageWindow(m.id).tab);
+        let w;
+        if (props.windowId) {
+          w = props.windowId === -2 ? tb.windows.get(ctx.windowId ?? tb.topWindowId) : tb.windows.get(props.windowId);
+          if (!w) throw new ExtensionError(`Invalid window ID: ${props.windowId}`);
+          if (w.type !== "normal") throw new ExtensionError(`Window with ID ${props.windowId} is not a normal window`);
+        } else {
+          const top = tb.windows.get(tb.topWindowId);
+          w = top?.type === "normal" ? top : tb.mainWindow; // MODEL: windowTracker.topNormalWindow
+        }
+        const active = props.active ?? true;
+        const before = w.tabIds.map((id) => [id, tb.tabs.get(id).active]);
+        const opener = tb.activeTab(w.id);
+        const tab = tb.addTab(w.id, "messageDisplay", { selected: [m.id], openerTabId: opener?.id ?? null });
+        if (!active) {
+          tab.active = false;
+          for (const [id, wasActive] of before) tb.tabs.get(id).active = wasActive;
+        }
+        tb.runDisplayScripts(tab);
+        return tb.tabInfo(tab);
       },
 
       // ---- tabs
@@ -1378,6 +1472,42 @@ class FakeThunderbird {
         }
         if (!tab || tab.type !== "mail") throw new ExtensionError(`Invalid mail tab ID: ${tabId}`);
         return tb.messageList(tab.selected);
+      },
+
+      // ext-mailTabs.js:640-735. Needs both messagesRead and accountsRead, checked
+      // by the implementation (the schema's "permissions" only need one of them
+      // for the function to exist). Messages all in the tab's view are selected
+      // there; otherwise, if they share a folder, the tab switches to it
+      // (selectFolderRow) and selects them; a folder with no row in any folder
+      // mode cannot be shown. Unknown ids are dropped (:687-689).
+      "mailTabs.setSelectedMessages"([tabId, messageIds]) {
+        if (!tb.builder.hasPermission("messagesRead") || !tb.builder.hasPermission("accountsRead")) {
+          throw new ExtensionError('Using mailTabs.setSelectedMessages() requires the "accountsRead" and the "messagesRead" permission');
+        }
+        let tab;
+        if (tabId) {
+          tab = tb.tabs.get(tabId);
+          if (!tab) throw new ExtensionError(`Invalid tab ID: ${tabId}`); // ext-mail.js:564
+        } else {
+          tab = tb.activeTab(tb.topWindowId);
+          tabId = tab?.id;
+        }
+        if (!tab || tab.type !== "mail") throw new ExtensionError(`Invalid mail tab ID: ${tabId}`);
+        const msgs = messageIds.map((id) => tb.messages.get(id)).filter(Boolean);
+        if (msgs.length) {
+          const allInCurrentView = msgs.every((m) => m.folder.id === tab.folder.id);
+          const allInSameFolder = msgs.every((m) => m.folder.id === msgs[0].folder.id);
+          if (!allInCurrentView && !allInSameFolder) {
+            throw new ExtensionError("Requested messages are not in the same folder and are also not in the current view, cannot select all of them at the same time");
+          }
+          if (!allInCurrentView) {
+            if (tb.unviewable.has(msgs[0].folder.id)) {
+              throw new ExtensionError("Folder of the requested message(s) is not viewable in any of the enabled folder modes");
+            }
+            tab.folder = msgs[0].folder;
+          }
+        }
+        tb.selectMessages(msgs.map((m) => m.id), { tab });
       },
 
       // ---- windows (ext-windows.js:364-570)

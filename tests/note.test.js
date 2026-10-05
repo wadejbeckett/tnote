@@ -241,25 +241,41 @@ describe("note editor (note.html + note.js)", { skip }, () => {
     assertClean(tb);
   });
 
-  it("toolbar button with the reading pane hidden edits the one message selected in the list", async (t) => {
+  // Until v0.4.2 the toolbar button opened note.html without an id, so these
+  // ran through it. Since v0.5.0 that button opens the All notes list and no
+  // button opens note.html while the reading pane is hidden, but note.js and
+  // background.js keep the fallback, so the page is loaded directly.
+  it("without ?id and with the reading pane hidden, edits the one message selected in the list", async (t) => {
+    const { tb, msgs } = await boot(t, { messages: THREE });
+    tb.setMessagePaneVisible(false);
+    tb.selectMessages([msgs[2].id]);
+    const { $ } = await editor(tb, "note.html");
+    assert.equal($("subject").textContent, "Lunch?");
+    assert.equal($("status").textContent, "");
+    assertClean(tb);
+  });
+
+  it("without ?id and with several messages selected says \"Select one message to add a note.\"", async (t) => {
+    const { tb, msgs } = await boot(t, { messages: THREE });
+    tb.setMessagePaneVisible(false);
+    tb.selectMessages([msgs[0].id, msgs[1].id]);
+    const { page, $ } = await editor(tb, "note.html");
+    assert.equal(page.closed, false);
+    assert.equal($("status").textContent, SELECT_ONE);
+    assertClean(tb);
+  });
+
+  it("the toolbar button opens the All notes list, not the editor, whatever is selected (v0.5.0)", async (t) => {
     const { tb, msgs } = await boot(t, { messages: THREE });
     tb.setMessagePaneVisible(false);
     tb.selectMessages([msgs[2].id]);
     const popup = tb.clickActionButton("browserAction");
     await flush();
-    assert.equal(popup.page.document.getElementById("subject").textContent, "Lunch?");
-    assert.equal(popup.page.document.getElementById("status").textContent, "");
-    assertClean(tb);
-  });
-
-  it("toolbar button with several messages selected says \"Select one message to add a note.\"", async (t) => {
-    const { tb, msgs } = await boot(t, { messages: THREE });
-    tb.setMessagePaneVisible(false);
-    tb.selectMessages([msgs[0].id, msgs[1].id]);
-    const popup = tb.clickActionButton("browserAction");
-    await flush();
-    assert.equal(popup.page.closed, false);
-    assert.equal(popup.page.document.getElementById("status").textContent, SELECT_ONE);
+    assert.equal(popup.url, tb.baseUrl + "list.html");
+    assert.equal(popup.page.document.getElementById("text"), null, "no editor text box");
+    assert.ok(popup.page.document.getElementById("search"), "the list's search box");
+    assert.deepEqual(saves(tb), []);
+    assert.deepEqual(tb.apiCalls("runtime.sendMessage"), [], "the list asks the background for nothing");
     assertClean(tb);
   });
 
