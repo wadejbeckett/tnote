@@ -169,8 +169,8 @@ describe("manifest.json", { skip }, () => {
     assert.deepEqual((await ok.messages.query({ folderId: "account1://INBOX", headerMessageId: "x@example.com", messagesPerPage: 1 })).messages, []);
   });
 
-  it("is version 0.6.1", () => {
-    assert.equal(readManifest().version, "0.6.1");
+  it("is version 0.6.2", () => {
+    assert.equal(readManifest().version, "0.6.2");
   });
 
   it("tnote.xpi contains exactly the current src/ files plus LICENSE", (t) => {
